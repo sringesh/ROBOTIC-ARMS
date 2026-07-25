@@ -1,0 +1,533 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP32Servo.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+
+// Local Wi-Fi Configuration (Access Point mode)
+const char* ssid = "RoboticArm-AP";
+const char* password = "123456789"; // Minimum 8 characters
+
+// Pin Configurations for 4-axis Servos
+const int pinJ1 = 13;
+const int pinJ2 = 12;
+const int pinJ3 = 14;
+const int pinJ4 = 27;
+
+Servo servoJ1, servoJ2, servoJ3, servoJ4;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+bool isRecording = false;
+const char* tempFile = "/temp.csv";
+
+// --- STATE MACHINE VARIABLES (For non-blocking playback) ---
+bool isPlaying = false;
+File playbackFile;
+unsigned long lastStepTime = 0;
+const int stepDelay = 300; // 300ms between playback steps
+
+// --- NEW VARIABLES (For non-blocking recording) ---
+bool pendingRecord = false;
+int recJ1, recJ2, recJ3, recJ4;
+
+// Forward declarations
+void moveServos(int j1, int j2, int j3, int j4);
+void recordStep(int j1, int j2, int j3, int j4);
+void startPlayback(String sequenceName);
+void sendSequenceList();
+
+// HTML dashboard embedded directly into flash memory
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Offline Robotic Arm Control</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #121212; color: #e0e0e0; text-align: center; margin: 0; padding: 20px; }
+        .container { max-width: 500px; margin: auto; background: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        h2 { color: #00adb5; }
+        .control-group { margin: 15px 0; text-align: left; }
+        label { display: block; font-weight: bold; margin-bottom: 5px; }
+        input[type=range] { width: 100%; height: 8px; border-radius: 5px; background: #393e46; accent-color: #00adb5; }
+        .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+        button { padding: 12px; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; background: #393e46; color: #fff; transition: 0.2s; }
+        button:active { transform: scale(0.98); }
+        input[type=text], select { width: 100%; padding: 10px; border-radius: 6px; border: none; background: #222831; color: #fff; box-sizing: border-box; }
+        
+        .section-box { background: #2a2f38; padding: 15px; border-radius: 8px; margin-top: 20px; }
+        .section-box h3 { margin-top: 0; font-size: 16px; color: #fff; border-bottom: 1px solid #444; padding-bottom: 5px; }
+        
+        #btnRecord { background: #ff4757; }
+        #btnRecord.recording { background: #2ed573; animation: pulse 1.5s infinite; }
+        #btnSave { background: #3742fa; }
+        #btnPlay { background: #2ed573; }
+        #btnPlay.playing { background: #ffa502; animation: pulse 1.5s infinite; }
+        #btnDelete { background: #ffa502; }
+        #status { margin-top: 10px; padding: 10px; background: #222831; border-radius: 6px; font-style: italic; color: #00adb5; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Robotic Arm Controller</h2>
+        <div id="status">Status: Disconnected</div>
+
+        <div class="control-group">
+            <label>Joint 1 (Base): <span id="v1">90</span>°</label>
+            <input type="range" id="j1" min="0" max="180" value="90" oninput="sendAngles()">
+        </div>
+        <div class="control-group">
+            <label>Joint 2 (Shoulder): <span id="v2">90</span>°</label>
+            <input type="range" id="j2" min="0" max="180" value="90" oninput="sendAngles()">
+        </div>
+        <div class="control-group">
+            <label>Joint 3 (Elbow): <span id="v3">90</span>°</label>
+            <input type="range" id="j3" min="0" max="180" value="90" oninput="sendAngles()">
+        </div>
+        <div class="control-group">
+            <label>Joint 4 (Gripper): <span id="v4">90</span>°</label>
+            <input type="range" id="j4" min="0" max="180" value="90" oninput="sendAngles()">
+        </div>
+
+        <div class="section-box">
+            <h3>Record New Sequence</h3>
+            <div class="btn-grid">
+                <button id="btnRecord" onclick="toggleRecord()">Start Recording</button>
+            </div>
+            <div style="margin-top: 10px;">
+                <input type="text" id="seqName" placeholder="Enter name (e.g. GrabItem)">
+            </div>
+            <div class="btn-grid">
+                <button id="btnSave" onclick="saveSeq()" style="grid-column: span 2;">Save Sequence</button>
+            </div>
+        </div>
+
+        <div class="section-box">
+            <h3>Saved Sequences</h3>
+            <select id="seqList">
+                <option value="">No sequences found</option>
+            </select>
+            <div class="btn-grid">
+                <button id="btnPlay" onclick="playSeq()">Play Selected</button>
+                <button id="btnDelete" onclick="deleteSeq()">Delete Selected</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let gateway = `ws://${window.location.hostname}/ws`;
+        let websocket;
+        let recState = false;
+        let playState = false;
+        
+        // Throttling variables
+        let lastSendTime = 0;
+        let sendTimer;
+
+        window.addEventListener('load', initWebSocket);
+
+        function initWebSocket() {
+            websocket = new WebSocket(gateway);
+            websocket.onopen = () => { 
+                document.getElementById('status').innerText = "Status: Connected Offline";
+                websocket.send(JSON.stringify({action: "list"}));
+            };
+            websocket.onclose = () => { 
+                document.getElementById('status').innerText = "Status: Disconnected. Reconnecting..."; 
+                setTimeout(initWebSocket, 2000); 
+            };
+            websocket.onmessage = onMessage;
+        }
+
+        function onMessage(event) {
+            let data = JSON.parse(event.data);
+            if(data.type === "status") {
+                document.getElementById('status').innerText = "Status: " + data.msg;
+                if(data.msg === "Playback finished.") {
+                    playState = false;
+                    let btn = document.getElementById('btnPlay');
+                    btn.innerText = "Play Selected";
+                    btn.classList.remove('playing');
+                }
+            } 
+            else if (data.type === "sync") {
+                document.getElementById('j1').value = data.j1; document.getElementById('v1').innerText = data.j1;
+                document.getElementById('j2').value = data.j2; document.getElementById('v2').innerText = data.j2;
+                document.getElementById('j3').value = data.j3; document.getElementById('v3').innerText = data.j3;
+                document.getElementById('j4').value = data.j4; document.getElementById('v4').innerText = data.j4;
+            }
+            else if (data.type === "list") {
+                let select = document.getElementById('seqList');
+                select.innerHTML = "";
+                if(data.files.length === 0) {
+                    select.innerHTML = '<option value="">No sequences found</option>';
+                } else {
+                    data.files.forEach(file => {
+                        let opt = document.createElement('option');
+                        opt.value = file;
+                        opt.innerHTML = file;
+                        select.appendChild(opt);
+                    });
+                }
+            }
+        }
+
+        function sendAngles() {
+            if(playState) return; 
+            
+            let j1 = document.getElementById('j1').value; document.getElementById('v1').innerText = j1;
+            let j2 = document.getElementById('j2').value; document.getElementById('v2').innerText = j2;
+            let j3 = document.getElementById('j3').value; document.getElementById('v3').innerText = j3;
+            let j4 = document.getElementById('j4').value; document.getElementById('v4').innerText = j4;
+
+            let now = Date.now();
+            if (now - lastSendTime > 100) { 
+                websocket.send(JSON.stringify({action: "move", j1: parseInt(j1), j2: parseInt(j2), j3: parseInt(j3), j4: parseInt(j4)}));
+                lastSendTime = now;
+            } else {
+                clearTimeout(sendTimer);
+                sendTimer = setTimeout(() => {
+                    websocket.send(JSON.stringify({action: "move", j1: parseInt(j1), j2: parseInt(j2), j3: parseInt(j3), j4: parseInt(j4)}));
+                    lastSendTime = Date.now();
+                }, 100);
+            }
+        }
+
+        function toggleRecord() {
+            if(playState) return; 
+            recState = !recState;
+            let btn = document.getElementById('btnRecord');
+            if(recState) {
+                btn.innerText = "Stop Recording";
+                btn.classList.add('recording');
+                websocket.send(JSON.stringify({action: "start_record"}));
+            } else {
+                btn.innerText = "Start Recording";
+                btn.classList.remove('recording');
+                websocket.send(JSON.stringify({action: "stop_record"}));
+            }
+        }
+
+        function saveSeq() {
+            if(recState) toggleRecord();
+            let name = document.getElementById('seqName').value.trim();
+            if(name === "") { alert("Please enter a name for the sequence."); return; }
+            name = name.replace(/[^a-zA-Z0-9_-]/g, ""); 
+            websocket.send(JSON.stringify({action: "save", name: name}));
+            document.getElementById('seqName').value = "";
+        }
+
+        function playSeq() {
+            if(recState) toggleRecord();
+            let selected = document.getElementById('seqList').value;
+            if(selected === "") return;
+            
+            playState = !playState;
+            let btn = document.getElementById('btnPlay');
+            
+            if(playState) {
+                btn.innerText = "Stop Playback";
+                btn.classList.add('playing');
+                websocket.send(JSON.stringify({action: "start_playback", name: selected}));
+            } else {
+                btn.innerText = "Play Selected";
+                btn.classList.remove('playing');
+                websocket.send(JSON.stringify({action: "stop_playback"}));
+            }
+        }
+
+        function deleteSeq() {
+            let selected = document.getElementById('seqList').value;
+            if(selected === "") return;
+            if(confirm("Permanently delete sequence '" + selected + "'?")) {
+                websocket.send(JSON.stringify({action: "delete", name: selected}));
+            }
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void moveServos(int j1, int j2, int j3, int j4) {
+    servoJ1.write(j1);
+    servoJ2.write(j2);
+    servoJ3.write(j3);
+    servoJ4.write(j4);
+}
+
+void recordStep(int j1, int j2, int j3, int j4) {
+    File file = LittleFS.open(tempFile, FILE_APPEND);
+    if (!file) return;
+    file.printf("%d,%d,%d,%d\n", j1, j2, j3, j4);
+    file.close();
+}
+
+void startPlayback(String sequenceName) {
+    String filePath = "/" + sequenceName + ".csv";
+    playbackFile = LittleFS.open(filePath, FILE_READ);
+    
+    if (!playbackFile) {
+        ws.textAll("{\"type\":\"status\",\"msg\":\"Sequence not found.\"}");
+        return;
+    }
+    isPlaying = true;
+    ws.textAll("{\"type\":\"status\",\"msg\":\"Executing Playback: " + sequenceName + "\"}");
+}
+
+void sendSequenceList() {
+    File root = LittleFS.open("/");
+    File file = root.openNextFile();
+    
+    String jsonList = "{\"type\":\"list\",\"files\":[";
+    bool first = true;
+    
+    while(file) {
+        String fname = file.name();
+        if(fname.endsWith(".csv") && fname != "temp.csv") {
+            if(!first) jsonList += ",";
+            fname.replace(".csv", ""); 
+            jsonList += "\"" + fname + "\"";
+            first = false;
+        }
+        file = root.openNextFile();
+    }
+    jsonList += "]}";
+    ws.textAll(jsonList);
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        data[len] = 0;
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, data);
+        if (error) return;
+
+        String action = doc["action"];
+
+        if (action == "move" && !isPlaying) {
+            int j1 = doc["j1"]; int j2 = doc["j2"];
+            int j3 = doc["j3"]; int j4 = doc["j4"];
+            moveServos(j1, j2, j3, j4);
+            
+            // FIXED: Do not save file here! Flag it for the main loop to save.
+            if (isRecording) {
+                recJ1 = j1; recJ2 = j2; recJ3 = j3; recJ4 = j4;
+                pendingRecord = true; 
+            }
+        } 
+        else if (action == "start_record" && !isPlaying) {
+            LittleFS.remove(tempFile);
+            isRecording = true;
+        } 
+        else if (action == "stop_record") {
+            isRecording = false;
+        }
+        else if (action == "save") {
+            String seqName = doc["name"];
+            String finalPath = "/" + seqName + ".csv";
+            LittleFS.rename(tempFile, finalPath);
+            sendSequenceList();
+            ws.textAll("{\"type\":\"status\",\"msg\":\"Saved sequence: " + seqName + "\"}");
+        }
+        else if (action == "list") {
+            sendSequenceList();
+        }
+        else if (action == "start_playback") {
+            if (!isRecording && !isPlaying) {
+                String seqName = doc["name"];
+                startPlayback(seqName);
+            }
+        }
+        else if (action == "stop_playback") {
+            if(isPlaying) {
+                isPlaying = false;
+                if(playbackFile) playbackFile.close();
+                ws.textAll("{\"type\":\"status\",\"msg\":\"Playback finished.\"}");
+            }
+        }
+        else if (action == "delete") {
+            String seqName = doc["name"];
+            String filePath = "/" + seqName + ".csv";
+            LittleFS.remove(filePath);
+            sendSequenceList();
+            ws.textAll("{\"type\":\"status\",\"msg\":\"Deleted: " + seqName + "\"}");
+        }
+    }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_DATA) {
+        handleWebSocketMessage(arg, data, len);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    if (!LittleFS.begin(true)) {
+        Serial.println("An Error has occurred while mounting LittleFS");
+        return;
+    }
+
+    ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2); ESP32PWM::allocateTimer(3);
+    servoJ1.setPeriodHertz(50); servoJ2.setPeriodHertz(50);
+    servoJ3.setPeriodHertz(50); servoJ4.setPeriodHertz(50);
+    
+    servoJ1.attach(pinJ1, 500, 2400); servoJ2.attach(pinJ2, 500, 2400);
+    servoJ3.attach(pinJ3, 500, 2400); servoJ4.attach(pinJ4, 500, 2400);
+
+    moveServos(90, 90, 90, 90);
+
+    WiFi.softAP(ssid, password);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+
+    ws.onEvent(onEvent);
+    server.addHandler(&ws);
+    
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+        request->send_P(200, "text/html", index_html);
+    });
+
+    // ========================================================
+    // NEW: ROUTE TO RECEIVE OBJECT NAME FROM AMB82-MINI CAMERA
+    // ========================================================
+    server.on("/trigger", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (request->hasParam("obj")) {
+            String objName = request->getParam("obj")->value();
+            objName.trim(); // Clean up hidden formatting spaces
+            
+            // Displays the incoming object name cleanly on your Serial Monitor
+            Serial.println("\n[Wi-Fi Received] Camera detected object: '" + objName + "'");
+            
+            // Pass the string to our comparison & file execution scanner
+            handleTrigger(objName); 
+            
+            request->send(200, "text/plain", "Received object: " + objName);
+        } else {
+            request->send(400, "text/plain", "Error: Missing 'obj' parameter");
+        }
+    });
+    // ========================================================
+
+    server.begin();
+}
+bool isBusy = false;
+// Add this check inside your handleTrigger function
+void handleTrigger(String objName) {
+    // 1. Safety check: Is the arm already moving?
+    if (isPlaying) { 
+        Serial.println("-> Trigger Ignored: Robotic arm is busy running a sequence.");
+        return; 
+    }
+
+    // 2. Clean up the incoming object name text format
+    objName.trim();
+    objName.replace(".csv", "");
+    if (objName.startsWith("/")) {
+        objName.remove(0, 1);
+    }
+
+    Serial.println("\n[Dynamic Lookup] Searching LittleFS for object: '" + objName + "'");
+
+    // 3. Build the paths to search storage dynamically
+    String pathWithExt = "/" + objName + ".csv";
+    String pathRaw = "/" + objName;
+
+    // 4. Check if a matching dashboard file actually exists
+    if (LittleFS.exists(pathWithExt) || LittleFS.exists(pathRaw)) {
+        Serial.println("-> [MATCH FOUND] Found a saved sequence profile for: " + pathWithExt);
+        Serial.println("-> Launching physical playback sequence now...");
+        
+        // Pass the clean name directly to your playback engine!
+        startPlayback(objName); 
+    } 
+    else {
+        // If the camera sees an object but you haven't made a sequence for it yet:
+        Serial.print("-> [NO MATCH] Looked for '" + pathWithExt + "' but it doesn't exist. ");
+        Serial.println("Go to your web dashboard, record a movement, and save it exactly as '" + objName + "'");
+    }
+}
+
+void loop() {
+
+ if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim(); // Remove hidden carriage returns (\r) and spaces
+        
+        if (input.length() > 0) {
+            Serial.println("\n[Serial Input] Checking storage for: '" + input + "'");
+            
+            // 1. Clean the incoming string to match your dashboard format
+            String cleanName = input;
+            cleanName.replace(".csv", "");
+            if (cleanName.startsWith("/")) {
+                cleanName.remove(0, 1);
+            }
+
+            // 2. Map and check all path possibilities against LittleFS
+            String variantRaw = input;
+            String variantWithSlash = "/" + input;
+            String variantWithExt = input + ".csv";
+            String variantWithBoth = "/" + input + ".csv";
+            
+            bool fileExists = false;
+            if (LittleFS.exists(variantRaw) || LittleFS.exists(variantWithSlash) || 
+                LittleFS.exists(variantWithExt) || LittleFS.exists(variantWithBoth)) {
+                fileExists = true;
+            }
+
+            // 3. Fire the playback trigger if a valid match is found
+            if (fileExists) {
+                Serial.print("-> Success! Found file. Triggering playback for clean name: ");
+                Serial.println(cleanName);
+                
+                // Passes clean name (e.g. "Clamper") directly into your arm sequence
+                handleTrigger(cleanName); 
+            } else {
+                Serial.println("-> ERROR: File not found in LittleFS. Check your spelling.");
+            }
+        }
+    }
+    // --- 1. Handle file saving ---
+    if (pendingRecord) {
+        pendingRecord = false; 
+        recordStep(recJ1, recJ2, recJ3, recJ4);
+    }
+
+    // --- 2. Playback Logic with "Busy" Lock ---
+    if (isPlaying) {
+        isBusy = true; // Lock the system while playing
+        
+        if (millis() - lastStepTime >= stepDelay) {
+            lastStepTime = millis();
+            
+            if (playbackFile.available()) {
+                String line = playbackFile.readStringUntil('\n');
+                if (line.length() > 0) {
+                    int j1, j2, j3, j4;
+                    if (sscanf(line.c_str(), "%d,%d,%d,%d", &j1, &j2, &j3, &j4) == 4) {
+                        moveServos(j1, j2, j3, j4);
+                        
+                        char syncData[128];
+                        snprintf(syncData, sizeof(syncData), "{\"type\":\"sync\",\"j1\":%d,\"j2\":%d,\"j3\":%d,\"j4\":%d}", j1, j2, j3, j4);
+                        ws.textAll(syncData);
+                    }
+                }
+            } else {
+                // Playback finished
+                isPlaying = false;
+                isBusy = false; // Unlock the system
+                playbackFile.close();
+                ws.textAll("{\"type\":\"status\",\"msg\":\"Playback finished.\"}");
+            }
+        }
+    }
+}
