@@ -1,0 +1,255 @@
+/*
+
+ Example guide:
+ https://www.amebaiot.com/en/amebapro2-arduino-neuralnework-object-detection/
+
+ NN Model Selection
+ Select Neural Network(NN) task and models using modelSelect(nntask, objdetmodel, facedetmodel, facerecogmodel).
+ Replace with NA_MODEL if they are not necessary for your selected NN Task.
+
+ NN task
+ =======
+ OBJECT_DETECTION/ FACE_DETECTION/ FACE_RECOGNITION
+
+ Models
+ =======
+ YOLOv3 model         DEFAULT_YOLOV3TINY   / CUSTOMIZED_YOLOV3TINY
+ YOLOv4 model         DEFAULT_YOLOV4TINY   / CUSTOMIZED_YOLOV4TINY
+ YOLOv7 model         DEFAULT_YOLOV7TINY   / CUSTOMIZED_YOLOV7TINY
+ SCRFD model          DEFAULT_SCRFD        / CUSTOMIZED_SCRFD
+ MobileFaceNet model  DEFAULT_MOBILEFACENET/ CUSTOMIZED_MOBILEFACENET
+ No model             NA_MODEL
+ */
+
+#include "WiFi.h"
+#include "StreamIO.h"
+#include "VideoStream.h"
+#include "RTSP.h"
+#include "NNObjectDetection.h"
+#include "VideoStreamOverlay.h"
+#include "ObjectClassList.h"
+
+#define CHANNEL 0
+#define CHANNELNN 3 
+
+// Lower resolution for NN processing
+#define NNWIDTH  576
+#define NNHEIGHT 320
+                 
+unsigned long lockStartTime = 0;
+
+const unsigned long LOCK_DURATION = 3000;
+WiFiServer resumeServer(8081);     // FIXES: 'resumeServer' was not declared in this scope
+bool isLocked = false;             
+IPAddress esp32IP(192, 168, 4, 1); 
+int esp32Port = 80;
+
+VideoSetting config(VIDEO_FHD, 30, VIDEO_H264, 0);
+VideoSetting configNN(NNWIDTH, NNHEIGHT, 10, VIDEO_RGB, 0);
+NNObjectDetection ObjDet;
+RTSP rtsp;
+StreamIO videoStreamer(1, 1);
+StreamIO videoStreamerNN(1, 1);
+
+char ssid[] = "RoboticArm-AP";   // your network SSID (name)
+char pass[] = "123456789";       // your network password
+int status = WL_IDLE_STATUS;
+// Change this line at the top of your file:
+IPAddress ip; // Replaces String ip = "192.168.4.2";
+
+
+int rtsp_portnum;
+
+void setup() {
+    Serial.begin(115200);
+
+
+    // 1. Connect to your ESP32 network environment with debugging prints
+    Serial.println("\n--- Wi-Fi Initialization ---");
+    Serial.print("Attempting to connect to SSID: ");
+    Serial.println(ssid);
+    
+    WiFi.begin(ssid, pass);
+    
+    int timeout_counter = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+        timeout_counter++;
+        
+        // If it takes more than 10 seconds, print a warning
+        if (timeout_counter > 20) {
+            Serial.println("\n[WARNING] Still not connected! Check your ESP32 AP status.");
+            timeout_counter = 0; // Reset counter and keep trying
+        }
+    }
+    
+    Serial.println("\n[SUCCESS] Connected to ESP32 Network!");
+    // Change line 82 to remove .toString():
+ip = WiFi.localIP();
+    Serial.print("AMB82-MINI IP: ");
+    Serial.println(ip);
+
+    // Configure camera video channels with video format information
+    // Adjust the bitrate based on your WiFi network quality
+    config.setBitrate(2 * 1024 * 1024);     // Recommend to use 2Mbps for RTSP streaming to prevent network congestion
+    Camera.configVideoChannel(CHANNEL, config);
+    Camera.configVideoChannel(CHANNELNN, configNN);
+    Camera.videoInit();
+
+    // Configure RTSP with corresponding video format information
+    rtsp.configVideo(config);
+    rtsp.begin();
+    rtsp_portnum = rtsp.getPort();
+
+    // Configure object detection with corresponding video format information
+    // Select Neural Network(NN) task and models
+    ObjDet.configVideo(configNN);
+    ObjDet.modelSelect(OBJECT_DETECTION, DEFAULT_YOLOV4TINY, NA_MODEL, NA_MODEL);
+    ObjDet.begin();
+
+    // Configure StreamIO object to stream data from video channel to RTSP
+    videoStreamer.registerInput(Camera.getStream(CHANNEL));
+    videoStreamer.registerOutput(rtsp);
+    if (videoStreamer.begin() != 0) {
+        Serial.println("StreamIO link start failed");
+    }
+
+    // Start data stream from video channel
+    Camera.channelBegin(CHANNEL);
+
+    // Configure StreamIO object to stream data from RGB video channel to object detection
+    videoStreamerNN.registerInput(Camera.getStream(CHANNELNN));
+    videoStreamerNN.setStackSize();
+    videoStreamerNN.setTaskPriority();
+    videoStreamerNN.registerOutput(ObjDet);
+    if (videoStreamerNN.begin() != 0) {
+        Serial.println("StreamIO link start failed");
+    }
+
+    // Start video channel for NN
+    Camera.channelBegin(CHANNELNN);
+
+    // Start OSD drawing on RTSP video channel
+    OSD.configVideo(CHANNEL, config);
+    OSD.begin();
+    Serial.println("System fully armed. Dropping into main loop...");
+}
+
+
+// Global Variables (Place these at the very top of your main sketch file)
+
+// --- Make sure this global variable is placed at the very top of your sketch ---
+unsigned long objectDetectionTimer = 0; 
+const unsigned long REQUIRED_DETECTION_TIME = 100; // 2 seconds continuous visibility
+
+
+// Helper Function: Directly transmits the string name over HTTP to your ESP32 WebServer
+bool sendObjectTrigger(String objName) {
+    WiFiClient client;
+    if (client.connect(esp32IP, esp32Port)) {
+        // Sends standard HTTP request targeting your new ESP32 route: /trigger?obj=object_name
+        client.print(String("GET /trigger?obj=") + objName + " HTTP/1.1\r\n" +
+                     "Host: 192.168.4.1\r\n" +
+                     "Connection: close\r\n\r\n");
+        client.stop();
+        Serial.println("-> Trigger string [" + objName + "] sent to ESP32 successfully.");
+        return true;
+    }
+    Serial.println("-> Transmission Failed: ESP32 server unreachable.");
+    return false;
+}
+void loop() {
+    // 1. Handle post-trigger cooldown timer
+    if (isLocked) {
+        if (millis() - lockStartTime >= LOCK_DURATION) {
+            isLocked = false;
+            Serial.println("-> Cooldown finished. Ready for next detection trigger.");
+        }
+    }
+
+    // 2. Grab AI results
+    std::vector<ObjectDetectionResult> results = ObjDet.getResult();
+    uint16_t im_h = config.height();
+    uint16_t im_w = config.width();
+    
+    bool objectFoundThisFrame = false;
+    int detectedCount = ObjDet.getResultCount();
+
+    // 3. Process detection data if any objects are found
+    if (detectedCount > 0) {
+        // Correct way to clear the canvas on this hardware platform
+        OSD.createBitmap(CHANNEL); 
+
+        for (int i = 0; i < detectedCount; i++) {
+            int obj_type = results[i].type();
+            
+            if (itemList[obj_type].filter) {    
+                objectFoundThisFrame = true; 
+                
+                ObjectDetectionResult item = results[i];
+                int xmin = (int)(item.xMin() * im_w);
+                int xmax = (int)(item.xMax() * im_w);
+                int ymin = (int)(item.yMin() * im_h);
+                int ymax = (int)(item.yMax() * im_h);
+
+                // Draw bounding box
+                OSD.drawRect(CHANNEL, xmin, ymin, xmax, ymax, 3, OSD_COLOR_WHITE);
+
+                // --- TRIGGER LOGIC ---
+                if (!isLocked) {
+                    if (objectDetectionTimer == 0) {
+                        objectDetectionTimer = millis();
+                        Serial.print("-> Target spotted [");
+                        Serial.print(itemList[obj_type].objectName);
+                        Serial.println("]! Verifying presence...");
+                    } 
+                    else if (millis() - objectDetectionTimer >= REQUIRED_DETECTION_TIME) {
+                        String detectedObject = String(itemList[obj_type].objectName);
+                        
+                        Serial.println("-> Target verified! Sending command to ESP32.");
+                        if (sendObjectTrigger(detectedObject)) {
+                            isLocked = true; 
+                            lockStartTime = millis(); 
+                            objectDetectionTimer = 0; 
+                            break; 
+                        }
+                    }
+                }
+            }
+        }
+        // Push drawings to screen layer
+        OSD.update(CHANNEL);
+    }
+
+    // 4. Handle target loss and clean the screen layout safely
+    if (!objectFoundThisFrame && !isLocked) {
+        if (objectDetectionTimer != 0) {
+            Serial.println("-> Target lost. Resetting verification timer.");
+            objectDetectionTimer = 0;
+            OSD.createBitmap(CHANNEL); 
+            OSD.update(CHANNEL); 
+        }
+    }
+
+    // Caps the frame rate cleanly at ~30 FPS. This gives the OSD 
+    // graphics engine and Wi-Fi stack plenty of time to clear messages!
+    delay(30); 
+}
+    // Dynamic delay: gives the background OS threads exactly 10ms 
+    // to process network tasks without blocking the camera engine!
+  
+    // REMOVED delay(100) to stop the VOE queue from backing up!
+
+// Helper Function: Listens for the unlock packet from the ESP32 to enable processing again
+void checkResumeSignal() {
+    WiFiClient client = resumeServer.available(); // Now visible!
+    if (client) {
+        String msg = client.readStringUntil('\n');
+        if (msg.indexOf("sequence_done") >= 0) {
+            isLocked = false; 
+            Serial.println("-> Resume confirmation received. Re-enabling detection.");
+        }
+        client.stop();
+    }
+}
