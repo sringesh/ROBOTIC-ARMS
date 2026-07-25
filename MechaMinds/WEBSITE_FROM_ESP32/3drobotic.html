@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Robotic Arm Control Panel</title>
+  
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-database.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #121214;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+      margin: 0;
+    }
+    h2 { color: #6366f1; margin-bottom: 10px; font-weight: 600; }
+    
+    .main-container {
+      display: flex;
+      flex-direction: row;
+      gap: 30px;
+      align-items: flex-start;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .control-panel {
+      background: #1e1e24;
+      padding: 25px;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      width: 100%;
+      max-width: 400px;
+    }
+    
+    /* 3D CANVAS VIEWPORT */
+    #canvas3d-container {
+      width: 450px;
+      height: 450px;
+      background: #09090b;
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+      position: relative;
+      overflow: hidden;
+      border: 1px solid #27272a;
+    }
+
+    .slider-group { margin-bottom: 20px; }
+    .slider-group label {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: #94a3b8;
+    }
+    input[type="range"] {
+      width: 100%;
+      height: 6px;
+      background: #334155;
+      border-radius: 4px;
+      outline: none;
+      -webkit-appearance: none;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 18px;
+      height: 18px;
+      background: #6366f1;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: transform 0.1s;
+    }
+    input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+    
+    .btn-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 25px;
+    }
+    .full-width-btn { grid-column: span 2; }
+    
+    button {
+      padding: 12px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.1s;
+    }
+    button:active { transform: scale(0.98); }
+    
+    #recordBtn { background-color: #ef4444; color: white; }
+    #recordBtn.recording { background-color: #b91c1c; animation: pulse 1.5s infinite; }
+    
+    #playbackBtn { background-color: #10b981; color: white; }
+    #playbackBtn.paused { background-color: #f59e0b; color: white; }
+    #playbackBtn:disabled { background-color: #334155; color: #64748b; cursor: not-allowed; }
+    
+    #clearBtn { background-color: #3b82f6; color: white; }
+    #clearBtn:hover { background-color: #2563eb; }
+    
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.6; }
+      100% { opacity: 1; }
+    }
+    .status-text {
+      text-align: center;
+      color: #64748b;
+      font-size: 0.9rem;
+      margin-top: 15px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Robotic Arm Control Panel</h2>
+
+  <div class="main-container">
+    <div class="control-panel">
+      <div class="slider-group">
+        <label>Base Joint: <span id="baseVal">90</span>°</label>
+        <input type="range" id="base" min="0" max="180" value="90">
+      </div>
+
+      <div class="slider-group">
+        <label>Shoulder Joint: <span id="shoulderVal">90</span>°</label>
+        <input type="range" id="shoulder" min="0" max="180" value="90">
+      </div>
+
+      <div class="slider-group">
+        <label>Arm Extension: <span id="armVal">90</span>°</label>
+        <input type="range" id="arm" min="0" max="180" value="90">
+      </div>
+
+      <div class="slider-group">
+        <label>Clamper / End Effector: <span id="clamperVal">90</span>°</label>
+        <input type="range" id="clamper" min="0" max="180" value="90">
+      </div>
+
+      <div class="btn-container">
+        <button id="recordBtn">Start Recording</button>
+        <button id="playbackBtn">Run Playback</button>
+        <button id="clearBtn" class="full-width-btn">Clear Recorded Stream</button>
+      </div>
+      <div class="status-text" id="statusLabel">System Ready</div>
+    </div>
+
+    <div id="canvas3d-container"></div>
+  </div>
+
+  <script>
+    // --- 1. FIREBASE SYSTEM INITIALIZATION ---
+    const firebaseConfig = {
+      apiKey: "AIzaSyBuyi9KQYRhTFgxEUkLHWkB4h38ENLjlxY",
+      databaseURL: "https://robotic-arm-8ca01-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "robotic-arm-8ca01",
+      storageBucket: "robotic-arm-8ca01.appspot.com"
+    };
+    
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    // DOM Elements
+    const sliders = {
+      base: document.getElementById('base'),
+      shoulder: document.getElementById('shoulder'),
+      arm: document.getElementById('arm'),
+      clamper: document.getElementById('clamper')
+    };
+    
+    const labels = {
+      base: document.getElementById('baseVal'),
+      shoulder: document.getElementById('shoulderVal'),
+      arm: document.getElementById('armVal'),
+      clamper: document.getElementById('clamperVal')
+    };
+
+    const recordBtn = document.getElementById('recordBtn');
+    const playbackBtn = document.getElementById('playbackBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const statusLabel = document.getElementById('statusLabel');
+
+    let isRecording = false;
+    let recordedTimeline = [];
+    let recordInterval = null;
+
+    let isPlaying = false;
+    let isPaused = false;
+    let cachedFrames = [];
+    let currentFrameIndex = 0;
+    let playbackInterval = null;
+
+    // --- 2. THREE.JS 3D VISUALIZATION ENGINE ---
+    let scene, camera, renderer, armBaseNode, shoulderNode, armExtNode, clamperNode;
+
+    function init3D() {
+      const container = document.getElementById('canvas3d-container');
+      
+      // Create Scene
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x09090b);
+
+      // Create Camera
+      camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+      camera.position.set(12, 15, 22);
+      camera.lookAt(0, 5, 0);
+
+      // Create WebGL Renderer
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.shadowMap.enabled = true;
+      container.appendChild(renderer.domElement);
+
+      // Lights
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(10, 20, 15);
+      scene.add(dirLight);
+
+      // Reference Grid & Axes
+      const gridHelper = new THREE.GridHelper(30, 30, 0x3f3f46, 0x27272a);
+      gridHelper.position.y = -0.1;
+      scene.add(gridHelper);
+
+      const axesHelper = new THREE.AxesHelper(6);
+      scene.add(axesHelper);
+
+      // --- ASSEMBLE ARTICULATED ROBOTIC ARM HIERARCHY ---
+      // Base Platform
+      const baseGeo = new THREE.BoxGeometry(4, 1, 4);
+      const baseMat = new THREE.MeshStandardMaterial({ color: 0x3f3f46 });
+      const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+      baseMesh.position.y = 0.5;
+      scene.add(baseMesh);
+
+      // Rotating Base Node (Y-Axis Rotation)
+      armBaseNode = new THREE.Group();
+      armBaseNode.position.y = 1.0;
+      scene.add(armBaseNode);
+
+      // Base visual block
+      const rotBaseGeo = new THREE.BoxGeometry(2, 1.5, 2);
+      const rotBaseMat = new THREE.MeshStandardMaterial({ color: 0x6366f1 });
+      const rotBaseMesh = new THREE.Mesh(rotBaseGeo, rotBaseMat);
+      rotBaseMesh.position.y = 0.75;
+      armBaseNode.add(rotBaseMesh);
+
+      // Shoulder Node (X/Z-Axis Pivot)
+      shoulderNode = new THREE.Group();
+      shoulderNode.position.set(0, 1.5, 0);
+      armBaseNode.add(shoulderNode);
+
+      // Shoulder joint visual cylinder
+      const shoulderGeo = new THREE.CylinderGeometry(0.6, 0.6, 0.8, 16);
+      shoulderGeo.rotateX(Math.PI / 2);
+      const shoulderMat = new THREE.MeshStandardMaterial({ color: 0xef4444 });
+      const shoulderMesh = new THREE.Mesh(shoulderGeo, shoulderMat);
+      shoulderNode.add(shoulderMesh);
+
+      // Arm 1 (Lower arm segment)
+      const arm1Geo = new THREE.BoxGeometry(0.8, 6, 0.8);
+      const armMat = new THREE.MeshStandardMaterial({ color: 0x0ea5e9 });
+      const arm1Mesh = new THREE.Mesh(arm1Geo, armMat);
+      // Offset mesh so rotation occurs at the joint base
+      arm1Mesh.position.y = 3.0;
+      shoulderNode.add(arm1Mesh);
+
+      // Arm Extension Node (Elbow Pivot)
+      armExtNode = new THREE.Group();
+      armExtNode.position.set(0, 6.0, 0);
+      shoulderNode.add(armExtNode);
+
+      // Elbow joint visual cylinder
+      const elbowMesh = new THREE.Mesh(shoulderGeo, shoulderMat);
+      armExtNode.add(elbowMesh);
+
+      // Arm 2 (Upper arm segment extending from elbow)
+      const arm2Mesh = new THREE.Mesh(arm1Geo, new THREE.MeshStandardMaterial({ color: 0x10b981 }));
+      arm2Mesh.position.y = 3.0;
+      armExtNode.add(arm2Mesh);
+
+      // Clamper Node (End-Effector Wrist)
+      clamperNode = new THREE.Group();
+      clamperNode.position.set(0, 6.0, 0);
+      armExtNode.add(clamperNode);
+
+      // Clamper/Gripper visual model
+      const clampBaseGeo = new THREE.BoxGeometry(1.6, 0.8, 1.6);
+      const clampMat = new THREE.MeshStandardMaterial({ color: 0xf59e0b });
+      const clampBase = new THREE.Mesh(clampBaseGeo, clampMat);
+      clampBase.position.y = 0.4;
+      clamperNode.add(clampBase);
+
+      // Left finger
+      const fingerGeo = new THREE.BoxGeometry(0.4, 1.2, 0.4);
+      const fingerL = new THREE.Mesh(fingerGeo, clampMat);
+      fingerL.position.set(-0.6, 1.2, 0);
+      clamperNode.add(fingerL);
+
+      // Right finger
+      const fingerR = new THREE.Mesh(fingerGeo, clampMat);
+      fingerR.position.set(0.6, 1.2, 0);
+      clamperNode.add(fingerR);
+
+      // Initial alignment based on default slider values (90 degrees)
+      update3DArmAngles(90, 90, 90, 90);
+      animate3D();
+    }
+
+    // Map 0-180 degree ranges to accurate 3D rotations in local radian coordinates
+    function update3DArmAngles(baseVal, shoulderVal, armVal, clamperVal) {
+      if (!armBaseNode) return;
+
+      // Map slider 0-180 to Radians: centers at 90° (0 rad adjustment)
+      const baseRad    = (baseVal - 90) * (Math.PI / 180);
+      const shoulderRad = (shoulderVal - 90) * (Math.PI / 180);
+      const armRad      = (armVal - 90) * (Math.PI / 180);
+      const clampScale  = 0.5 + (clamperVal / 180); // Scales claw spread base
+
+      // Apply rotations directly to hierarchical nodes
+      // Base rotates on Y axis (left/right)
+      armBaseNode.rotation.y = baseRad;
+
+      // Shoulder rotates on Z axis (up/down)
+      shoulderNode.rotation.z = shoulderRad;
+
+      // Arm extension rotates on Z axis relative to shoulder
+      armExtNode.rotation.z = armRad;
+
+      // Clamper gripper width scale modifier
+      clamperNode.scale.set(1, 1, clampScale);
+    }
+
+    function animate3D() {
+      requestAnimationFrame(animate3D);
+      renderer.render(scene, camera);
+    }
+
+    // Initialize 3D viewport once page structure loads
+    window.addEventListener('DOMContentLoaded', init3D);
+
+
+    // --- 3. LIVE MANUAL SLIDER INTERACTION ENGINE ---
+    function updateSliderRoom(joint, value) {
+      labels[joint].innerText = value;
+      db.ref(`/arm_state/${joint}`).set(parseInt(value));
+    }
+
+    Object.keys(sliders).forEach(joint => {
+      sliders[joint].addEventListener('input', (e) => {
+        if (!isPlaying || isPaused) {
+          updateSliderRoom(joint, e.target.value);
+        }
+      });
+    });
+
+    // Real-time synchronization pipe: updates physical hardware AND 3D digital simulation
+    db.ref('/arm_state').on('value', (snapshot) => {
+      const data = snapshot.val();
+      if (data && !isRecording && (!isPlaying || isPaused)) {
+        Object.keys(data).forEach(joint => {
+          if (sliders[joint] && document.activeElement !== sliders[joint]) {
+            sliders[joint].value = data[joint];
+            labels[joint].innerText = data[joint];
+          }
+        });
+        
+        // Update 3D Model Positions simultaneously
+        update3DArmAngles(
+          parseInt(data.base) || 90,
+          parseInt(data.shoulder) || 90,
+          parseInt(data.arm) || 90,
+          parseInt(data.clamper) || 90
+        );
+      }
+    });
+
+    // --- 4. TIMELINE RECORDING ENGINE ---
+    recordBtn.addEventListener('click', () => {
+      if (!isRecording) {
+        resetPlaybackEngineState();
+
+        isRecording = true;
+        recordedTimeline = [];
+        recordBtn.innerText = "Stop Recording";
+        recordBtn.classList.add('recording');
+        playbackBtn.disabled = true;
+        clearBtn.disabled = true;
+        statusLabel.innerText = "Recording timeline changes...";
+
+        recordInterval = setInterval(() => {
+          recordedTimeline.push({
+            base: parseInt(sliders.base.value),
+            shoulder: parseInt(sliders.shoulder.value),
+            arm: parseInt(sliders.arm.value),
+            clamper: parseInt(sliders.clamper.value)
+          });
+          statusLabel.innerText = `Captured ${recordedTimeline.length} animation frames...`;
+        }, 100);
+
+      } else {
+        isRecording = false;
+        clearInterval(recordInterval);
+        recordBtn.innerText = "Start Recording";
+        recordBtn.classList.remove('recording');
+        playbackBtn.disabled = false;
+        clearBtn.disabled = false;
+
+        if (recordedTimeline.length > 0) {
+          statusLabel.innerText = "Saving path timeline to Firebase cloud...";
+          db.ref('/stream').set(recordedTimeline)
+            .then(() => {
+              statusLabel.innerText = `Saved successfully! Total frames: ${recordedTimeline.length}`;
+            })
+            .catch(err => {
+              statusLabel.innerText = "Error syncing timeline cache.";
+              console.error(err);
+            });
+        } else {
+          statusLabel.innerText = "Recording cancelled. No frames captured.";
+        }
+      }
+    });
+
+    // --- 5. PLAY/PAUSE/RESUME PLAYBACK ENGINE ---
+    playbackBtn.addEventListener('click', () => {
+      if (isPlaying && !isPaused) {
+        isPaused = true;
+        clearInterval(playbackInterval);
+        playbackBtn.innerText = "Resume Playback";
+        playbackBtn.classList.add('paused');
+        recordBtn.disabled = false;
+        clearBtn.disabled = false;
+        statusLabel.innerText = `Playback Paused at frame (${currentFrameIndex}/${cachedFrames.length})`;
+        return;
+      }
+
+      if (isPlaying && isPaused) {
+        isPaused = false;
+        playbackBtn.innerText = "Pause Playback";
+        playbackBtn.classList.remove('paused');
+        recordBtn.disabled = true;
+        clearBtn.disabled = true;
+        runPlaybackLoop();
+        return;
+      }
+
+      statusLabel.innerText = "Fetching timeline stream array from cloud...";
+      playbackBtn.disabled = true; 
+      recordBtn.disabled = true;
+      clearBtn.disabled = true;
+
+      db.ref('/stream').once('value')
+        .then((snapshot) => {
+          const streamData = snapshot.val();
+
+          if (!streamData) {
+            statusLabel.innerText = "Playback failed: Target tracking array empty.";
+            playbackBtn.disabled = false;
+            recordBtn.disabled = false;
+            clearBtn.disabled = false;
+            return;
+          }
+
+          cachedFrames = Array.isArray(streamData) ? streamData : Object.values(streamData);
+          currentFrameIndex = 0;
+          isPlaying = true;
+          isPaused = false;
+          
+          playbackBtn.disabled = false;
+          playbackBtn.innerText = "Pause Playback";
+          
+          runPlaybackLoop();
+        })
+        .catch((error) => {
+          console.error("Firebase transaction failure:", error);
+          statusLabel.innerText = "Network fetch block caught.";
+          resetPlaybackEngineState();
+        });
+    });
+
+    function runPlaybackLoop() {
+      statusLabel.innerText = `Executing sequence playback (${currentFrameIndex + 1}/${cachedFrames.length})...`;
+
+      playbackInterval = setInterval(() => {
+        if (currentFrameIndex >= cachedFrames.length) {
+          clearInterval(playbackInterval);
+          statusLabel.innerText = "Sequence completed! Homing system configurations...";
+          
+          db.ref('/initial_state').once('value').then((initSnap) => {
+            const initData = initSnap.val();
+            if (initData) {
+              db.ref('/arm_state').update(initData);
+            }
+            resetPlaybackEngineState();
+          });
+          return;
+        }
+
+        const currentFrame = cachedFrames[currentFrameIndex];
+        const updatedAngles = {
+          base: currentFrame.base ?? 90,
+          shoulder: currentFrame.shoulder ?? 90,
+          arm: currentFrame.arm ?? 90,
+          clamper: currentFrame.clamper ?? 90
+        };
+
+        // Update UI components & 3D model angles simultaneously
+        Object.keys(updatedAngles).forEach(joint => {
+          sliders[joint].value = updatedAngles[joint];
+          labels[joint].innerText = updatedAngles[joint];
+        });
+
+        // Push straight into path registers -> ESP32 & 3D Canvas pick this up simultaneously
+        db.ref('/arm_state').update(updatedAngles);
+        
+        statusLabel.innerText = `Executing frame sequence (${currentFrameIndex + 1}/${cachedFrames.length})`;
+        currentFrameIndex++;
+      }, 100);
+    }
+
+    function resetPlaybackEngineState() {
+      isPlaying = false;
+      isPaused = false;
+      currentFrameIndex = 0;
+      cachedFrames = [];
+      if (playbackInterval) clearInterval(playbackInterval);
+      
+      playbackBtn.disabled = false;
+      playbackBtn.innerText = "Run Playback";
+      playbackBtn.classList.remove('paused');
+      recordBtn.disabled = false;
+      clearBtn.disabled = false;
+      statusLabel.innerText = "System Ready";
+    }
+
+    // --- 6. CLEAR STREAM DATA OPERATION ---
+    clearBtn.addEventListener('click', () => {
+      if (confirm("Are you sure you want to permanently delete your recorded stream data?")) {
+        statusLabel.innerText = "Clearing stream node data from Firebase...";
+        
+        db.ref('/stream').remove()
+          .then(() => {
+            statusLabel.innerText = "Stream data cleared successfully! Ready for new recording.";
+            resetPlaybackEngineState();
+          })
+          .catch((err) => {
+            statusLabel.innerText = "Failed to clear stream node data.";
+            console.error(err);
+          });
+      }
+    });
+  </script>
+</body>
+</html>
